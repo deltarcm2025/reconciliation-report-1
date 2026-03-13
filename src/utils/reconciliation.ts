@@ -1,4 +1,4 @@
-import { SafeBalanceRecord, OfficeAllyRecord, ReconciledRecord, ReconciliationSummary } from '../types';
+import { SafeBalanceRecord, OfficeAllyRecord, ReconciledRecord, ReconciliationSummary, PayerAnalysis } from '../types';
 
 /**
  * Normalizes a name by trimming, lowercasing, and removing extra spaces.
@@ -52,12 +52,27 @@ export const getProviderKey = (name: string) => {
 
 /**
  * Normalizes a date string to a standard YYYY-MM-DD format if possible.
+ * Uses manual parsing to avoid timezone shifts and locale issues.
  */
 const normalizeDate = (dateStr: string) => {
   if (!dateStr) return '';
+  
+  // Try to parse MM/DD/YYYY or M/D/YYYY
+  const match = dateStr.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (match) {
+    const [_, m, d, y] = match;
+    return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+  }
+
+  // Fallback to Date object if it's already YYYY-MM-DD or other format
   const d = new Date(dateStr);
   if (isNaN(d.getTime())) return dateStr.trim();
-  return d.toISOString().split('T')[0];
+  
+  // Use local components to avoid UTC shift
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 };
 
 /**
@@ -145,6 +160,46 @@ export const reconcileData = (
   // Track which OA groups have been matched
   const matchedOaGroupKeys = new Set<string>();
 
+  // 1.5. Calculate Mode of Payment per Payer
+  const payerPayments: Record<string, number[]> = {};
+  officeAlly.forEach(oa => {
+    const paid = parseCurrency(oa.paid);
+    if (paid > 0) {
+      if (!payerPayments[oa.payer]) payerPayments[oa.payer] = [];
+      payerPayments[oa.payer].push(paid);
+    }
+  });
+
+  const payerAnalysis: Record<string, PayerAnalysis> = {};
+  Object.entries(payerPayments).forEach(([payer, payments]) => {
+    const counts: Record<number, number> = {};
+    let maxCount = 0;
+    let mode = 0;
+    let sum = 0;
+    let min = Infinity;
+    let max = -Infinity;
+
+    payments.forEach(p => {
+      counts[p] = (counts[p] || 0) + 1;
+      if (counts[p] > maxCount) {
+        maxCount = counts[p];
+        mode = p;
+      }
+      sum += p;
+      if (p < min) min = p;
+      if (p > max) max = p;
+    });
+
+    payerAnalysis[payer] = {
+      payer,
+      mode,
+      avgPaid: sum / payments.length,
+      minPaid: min,
+      maxPaid: max,
+      count: payments.length
+    };
+  });
+
   // 2. Iterate through Safe Balance (Exams Done)
   safeBalance.forEach((sb, sbIdx) => {
     const sbLast = normalizeName(sb.patientLast);
@@ -177,7 +232,7 @@ export const reconcileData = (
       const nameMatch = superNormalize(oaLast) === superSbLast && superNormalize(oaFirst) === superSbFirst;
       const dateMatch = oaDos === sbDos;
       const dobMatch = !sbDob || !oaDob || sbDob === oaDob;
-      const providerMatch = oaProvider === sbProvider;
+      const providerMatch = getProviderKey(oa.provider) === getProviderKey(sb.provider);
       return nameMatch && dateMatch && dobMatch && providerMatch;
     }) || '';
 
@@ -236,7 +291,7 @@ export const reconcileData = (
           confidence = 'partial';
           reason = 'Name variation match (substring/spelling/reorder)';
           const group = oaGroups[matchedGroupKey];
-          isCrossProvider = normalizeProvider(group.records[0].provider) !== sbProvider;
+          isCrossProvider = getProviderKey(group.records[0].provider) !== getProviderKey(sb.provider);
         } else {
           // --- TIER 4: PARTIAL - DATE DISCREPANCY ---
           matchedGroupKey = findOaGroup((key, group) => {
@@ -256,7 +311,7 @@ export const reconcileData = (
             confidence = 'partial';
             reason = 'Date Similarity (Name/DOB match, DOS differs)';
             const group = oaGroups[matchedGroupKey];
-            isCrossProvider = normalizeProvider(group.records[0].provider) !== sbProvider;
+            isCrossProvider = getProviderKey(group.records[0].provider) !== getProviderKey(sb.provider);
           }
         }
       }
@@ -267,10 +322,20 @@ export const reconcileData = (
       const oa = group.records[0];
       matchedOaGroupKeys.add(matchedGroupKey);
       
-      const unitMismatch = group.totalUnits < 2;
+      const is97750 = group.records.some(r => r.cpt === '97750');
+      const unitMismatch = is97750 && group.totalUnits < 2;
+      
+      // Special rule: if billed twice as 1 unit for same patient/DOS, it's NOT an error
+      const isAcceptableSplit = is97750 && group.totalUnits === 2 && group.records.length >= 2;
+      
       const unitDetails = group.totalUnits >= 2 
         ? `${group.totalUnits} units (Correct)` 
         : `${group.totalUnits} unit only, no second record found`;
+
+      const paid = parseCurrency(oa.paid);
+      const mode = payerAnalysis[oa.payer]?.mode;
+      // Only flag as below mode if the difference is at least 5%
+      const isBelowMode = mode !== undefined && paid > 0 && paid < (mode * 0.95);
 
       records.push({
         id: `sb-${sbIdx}`,
@@ -285,10 +350,12 @@ export const reconcileData = (
         isCrossProvider,
         unitInfo: {
           totalUnits: group.totalUnits,
-          isMismatch: unitMismatch,
+          isMismatch: unitMismatch && !isAcceptableSplit,
           details: unitDetails
         },
-        paymentStatus: (oa.status as any) || 'Pending'
+        paymentStatus: paid > 0 ? 'Paid' : 'Pending',
+        payerMode: mode,
+        isBelowMode
       });
     } else {
       records.push({
@@ -336,9 +403,11 @@ export const reconcileData = (
     potentialMatchCount: records.filter(r => r.matchType === 'both' && r.matchConfidence === 'partial').length,
     doneNotBilledCount: records.filter(r => r.matchType === 'done_not_billed').length,
     billedNotDoneCount: records.filter(r => r.matchType === 'billed_not_done').length,
-    totalPaid: officeAlly.filter(oa => oa.status.toLowerCase() === 'paid').length,
-    totalUnpaid: officeAlly.filter(oa => oa.status.toLowerCase() !== 'paid').length,
+    totalPaid: officeAlly.filter(oa => parseCurrency(oa.paid) > 0).length,
+    totalUnpaid: officeAlly.filter(oa => parseCurrency(oa.paid) <= 0).length,
     totalCollected: officeAlly.reduce((sum, oa) => sum + parseCurrency(oa.paid), 0),
+    totalCharged: officeAlly.reduce((sum, oa) => sum + parseCurrency(oa.charge), 0),
+    payerAnalysis: Object.values(payerAnalysis),
   };
 
   return { records, summary };

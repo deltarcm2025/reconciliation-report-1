@@ -39,6 +39,17 @@ export interface ReconciledRecord {
     details: string;
   };
   paymentStatus: 'Paid' | 'Unpaid' | 'Pending' | 'N/A';
+  payerMode?: number;
+  isBelowMode?: boolean;
+}
+
+export interface PayerAnalysis {
+  payer: string;
+  mode: number;
+  avgPaid: number;
+  minPaid: number;
+  maxPaid: number;
+  count: number;
 }
 
 export interface ReconciliationSummary {
@@ -52,4 +63,6 @@ export interface ReconciliationSummary {
   totalPaid: number;
   totalUnpaid: number;
   totalCollected: number;
+  totalCharged: number;
+  payerAnalysis: PayerAnalysis[];
 }

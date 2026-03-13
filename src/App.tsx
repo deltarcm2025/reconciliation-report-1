@@ -20,8 +20,9 @@ import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
-import { SafeBalanceRecord, OfficeAllyRecord, ReconciledRecord, ReconciliationSummary } from './types';
+import { SafeBalanceRecord, OfficeAllyRecord, ReconciledRecord, ReconciliationSummary, PayerAnalysis } from './types';
 import { reconcileData, getProviderKey, superNormalize, parseCurrency } from './utils/reconciliation';
+import { parseOfficeAllyText, parseSafeBalanceText } from './utils/parsers';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -34,7 +35,7 @@ export default function App() {
   const [confirmedIds, setConfirmedIds] = useState<Set<string>>(new Set());
   const [isProcessing, setIsProcessing] = useState(false);
   const [activeTab, setActiveTab] = useState<'input' | 'report'>('input');
-  const [reportSubTab, setReportSubTab] = useState<'details' | 'summary' | 'verification' | 'cross-provider'>('details');
+  const [reportSubTab, setReportSubTab] = useState<'details' | 'summary' | 'verification' | 'cross-provider' | 'payers' | '97750'>('details');
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
   const [filterType, setFilterType] = useState<'all' | 'both' | 'potential' | 'done_not_billed' | 'billed_not_done'>('all');
@@ -54,30 +55,45 @@ export default function App() {
   const handleProcess = async () => {
     setIsProcessing(true);
     try {
-      const sbData = parsePastedData(safeBalanceRaw).map(row => ({
-        examDate: row['Exam Date'] || row['Date'] || '',
-        patientFirst: row['Patient First'] || row['First Name'] || '',
-        patientLast: row['Patient Last'] || row['Last Name'] || '',
-        dob: row['Date of Birth'] || row['DOB'] || '',
-        provider: row['Provider'] || '',
-      })) as SafeBalanceRecord[];
+      let sbData: SafeBalanceRecord[] = [];
+      let oaData: OfficeAllyRecord[] = [];
 
-      const oaData = parsePastedData(officeAllyRaw).map(row => ({
-        claimId: row['Claim ID'] || '',
-        provider: row['Provider'] || '',
-        payer: row['Payer'] || '',
-        patientName: row['Patient Name'] || '',
-        patientId: row['Patient ID'] || '',
-        cpt: row['CPT'] || '',
-        units: row['Units'] || '',
-        dos: row['DOS'] || '',
-        dob: row['DOB'] || row['Date of Birth'] || '',
-        charge: row['Charge'] || '',
-        paid: row['Paid'] || '',
-        status: row['Status'] || '',
-      })) as OfficeAllyRecord[];
+      // Try parsing as structured text first (OCR/Pasted Report)
+      const parsedOaText = parseOfficeAllyText(officeAllyRaw);
+      if (parsedOaText.length > 0) {
+        oaData = parsedOaText;
+      } else {
+        oaData = parsePastedData(officeAllyRaw).map(row => ({
+          claimId: row['Claim ID'] || '',
+          provider: row['Provider'] || '',
+          payer: row['Payer'] || '',
+          patientName: row['Patient Name'] || '',
+          patientId: row['Patient ID'] || '',
+          cpt: row['CPT'] || '',
+          units: row['Units'] || '',
+          dos: row['DOS'] || '',
+          dob: row['DOB'] || row['Date of Birth'] || '',
+          charge: row['Charge'] || '',
+          paid: row['Paid'] || '',
+          status: row['Status'] || '',
+        })) as OfficeAllyRecord[];
+      }
+
+      const parsedSbText = parseSafeBalanceText(safeBalanceRaw);
+      if (parsedSbText.length > 0) {
+        sbData = parsedSbText;
+      } else {
+        sbData = parsePastedData(safeBalanceRaw).map(row => ({
+          examDate: row['Exam Date'] || row['Date'] || '',
+          patientFirst: row['Patient First'] || row['First Name'] || '',
+          patientLast: row['Patient Last'] || row['Last Name'] || '',
+          dob: row['Date of Birth'] || row['DOB'] || '',
+          provider: row['Provider'] || '',
+        })) as SafeBalanceRecord[];
+      }
 
       const reconciled = reconcileData(sbData, oaData);
+      console.log('Parsed SB:', sbData.length, 'Parsed OA:', oaData.length);
       setConfirmedIds(new Set());
       setResults(reconciled);
       setActiveTab('report');
@@ -167,12 +183,14 @@ export default function App() {
   const providerMonthlyMatrix = useMemo(() => {
     if (!results) return null;
     const matrix: Record<string, Record<string, { done: number; billed: number; matched: number; collected: number }>> = {};
-    const providers = new Set<string>();
+    const providerDisplayNames: Record<string, string> = {};
     const months = new Set<string>();
 
     processedRecords.forEach(r => {
-      const providerName = r.provider;
-      providers.add(providerName);
+      const key = getProviderKey(r.provider);
+      if (!providerDisplayNames[key]) {
+        providerDisplayNames[key] = r.provider;
+      }
 
       const dateStr = r.safeBalance?.examDate || r.officeAlly?.dos;
       if (dateStr) {
@@ -180,20 +198,27 @@ export default function App() {
         const monthYear = d.toLocaleString('default', { month: 'short', year: 'numeric' });
         months.add(monthYear);
 
-        if (!matrix[providerName]) matrix[providerName] = {};
-        if (!matrix[providerName][monthYear]) matrix[providerName][monthYear] = { done: 0, billed: 0, matched: 0, collected: 0 };
+        if (!matrix[key]) matrix[key] = {};
+        if (!matrix[key][monthYear]) matrix[key][monthYear] = { done: 0, billed: 0, matched: 0, collected: 0 };
 
-        if (r.safeBalance) matrix[providerName][monthYear].done++;
+        if (r.safeBalance) matrix[key][monthYear].done++;
         if (r.officeAlly) {
-          matrix[providerName][monthYear].billed++;
-          matrix[providerName][monthYear].collected += parseCurrency(r.officeAlly.paid);
+          matrix[key][monthYear].billed++;
+          matrix[key][monthYear].collected += parseCurrency(r.officeAlly.paid);
         }
-        if (r.matchType === 'both' && (r.matchConfidence === 'exact' || confirmedIds.has(r.id))) matrix[providerName][monthYear].matched++;
+        if (r.matchType === 'both' && (r.matchConfidence === 'exact' || confirmedIds.has(r.id))) matrix[key][monthYear].matched++;
       }
     });
 
     const sortedMonths = Array.from(months).sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
-    return { matrix, months: sortedMonths, providers: Array.from(providers).sort() };
+    const sortedProviderKeys = Object.keys(matrix).sort((a, b) => providerDisplayNames[a].localeCompare(providerDisplayNames[b]));
+    
+    return { 
+      matrix, 
+      months: sortedMonths, 
+      providers: sortedProviderKeys,
+      displayNames: providerDisplayNames 
+    };
   }, [results, processedRecords, confirmedIds]);
 
   const verificationRecords = useMemo(() => {
@@ -250,6 +275,8 @@ export default function App() {
       totalPaid: recs.filter(r => r.officeAlly?.status.toLowerCase() === 'paid').length,
       totalUnpaid: recs.filter(r => r.officeAlly && r.officeAlly.status.toLowerCase() !== 'paid').length,
       totalCollected: recs.reduce((sum, r) => sum + (r.officeAlly ? parseCurrency(r.officeAlly.paid) : 0), 0),
+      totalCharged: recs.reduce((sum, r) => sum + (r.officeAlly ? parseCurrency(r.officeAlly.charged) : 0), 0),
+      payerAnalysis: results.summary.payerAnalysis, // Just use the overall payer analysis for now or filter it if needed
     };
     return summary;
   }, [filteredRecords, results, confirmedIds]);
@@ -678,6 +705,24 @@ export default function App() {
                 >
                   Cross-Provider
                 </button>
+                <button 
+                  onClick={() => setReportSubTab('payers')}
+                  className={cn(
+                    "px-6 py-3 text-sm font-bold uppercase tracking-widest transition-all border-b-2",
+                    reportSubTab === 'payers' ? "border-[#5A5A40] text-[#5A5A40]" : "border-transparent text-black/40 hover:text-black/60"
+                  )}
+                >
+                  Payer Analysis
+                </button>
+                <button 
+                  onClick={() => setReportSubTab('97750')}
+                  className={cn(
+                    "px-6 py-3 text-sm font-bold uppercase tracking-widest transition-all border-b-2",
+                    reportSubTab === '97750' ? "border-[#5A5A40] text-[#5A5A40]" : "border-transparent text-black/40 hover:text-black/60"
+                  )}
+                >
+                  97750 Analysis
+                </button>
               </div>
 
               {reportSubTab === 'details' && (
@@ -705,11 +750,11 @@ export default function App() {
 
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                 <div className="bg-white p-6 rounded-3xl border border-black/5 shadow-sm">
-                  <p className="text-xs font-bold uppercase tracking-widest text-[#1A1A1A]/40 mb-1">Total Exams Done</p>
+                  <p className="text-xs font-bold uppercase tracking-widest text-[#1A1A1A]/40 mb-1">Total Exams (Safe Balance)</p>
                   <p className="text-4xl font-serif italic text-[#5A5A40]">{monthSummary?.totalDone}</p>
                 </div>
                 <div className="bg-white p-6 rounded-3xl border border-black/5 shadow-sm">
-                  <p className="text-xs font-bold uppercase tracking-widest text-[#1A1A1A]/40 mb-1">Total Billed</p>
+                  <p className="text-xs font-bold uppercase tracking-widest text-[#1A1A1A]/40 mb-1">Total Billed (Office Ally)</p>
                   <div className="flex items-baseline gap-2">
                     <p className="text-4xl font-serif italic text-[#5A5A40]">{monthSummary?.totalBilled}</p>
                     <span className="text-xs text-black/40 font-medium">Events</span>
@@ -1011,6 +1056,148 @@ export default function App() {
             </>
           )}
 
+            {reportSubTab === 'payers' && results && (
+              <div className="space-y-6">
+                <div className="bg-white rounded-3xl border border-black/5 shadow-sm overflow-hidden">
+                  <div className="px-6 py-4 border-b border-black/5 bg-[#F5F5F0]/50">
+                    <h3 className="font-bold text-lg">Payer Payment Analysis</h3>
+                    <p className="text-sm text-black/40">Mode of payment and discrepancies per payer.</p>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead className="bg-black/5 text-black/40 uppercase text-[10px] font-bold tracking-widest">
+                        <tr>
+                          <th className="px-6 py-4">Payer</th>
+                          <th className="px-6 py-4 text-center">Claims</th>
+                          <th className="px-6 py-4 text-right">Mode (Most Freq)</th>
+                          <th className="px-6 py-4 text-right">Avg Paid</th>
+                          <th className="px-6 py-4 text-right">Min / Max</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-black/5">
+                        {results.summary.payerAnalysis.map(payer => (
+                          <tr key={payer.payer} className="hover:bg-[#F5F5F0]/30 transition-colors">
+                            <td className="px-6 py-4 font-bold">{payer.payer}</td>
+                            <td className="px-6 py-4 text-center">{payer.count}</td>
+                            <td className="px-6 py-4 text-right font-black text-emerald-700">
+                              {currencyFormatter.format(payer.mode)}
+                            </td>
+                            <td className="px-6 py-4 text-right">{currencyFormatter.format(payer.avgPaid)}</td>
+                            <td className="px-6 py-4 text-right text-xs text-black/40">
+                              {currencyFormatter.format(payer.minPaid)} - {currencyFormatter.format(payer.maxPaid)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <div className="bg-rose-50 rounded-3xl border border-rose-100 shadow-sm overflow-hidden">
+                  <div className="px-6 py-4 border-b border-rose-100 bg-rose-100/30">
+                    <h3 className="font-bold text-lg text-rose-900">Underpaid Claims</h3>
+                    <p className="text-sm text-rose-600/70">Claims where the paid amount is lower than the payer's mode (allowing 5% margin).</p>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead className="bg-rose-100/50 text-rose-900/40 uppercase text-[10px] font-bold tracking-widest">
+                        <tr>
+                          <th className="px-6 py-3">Patient Name</th>
+                          <th className="px-6 py-3">Payer</th>
+                          <th className="px-6 py-3 text-right">Paid</th>
+                          <th className="px-6 py-3 text-right">Payer Mode</th>
+                          <th className="px-6 py-3 text-right">Difference</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-rose-100">
+                        {results.records.filter(r => r.isBelowMode).map((r, i) => (
+                          <tr key={i} className="hover:bg-rose-100/20">
+                            <td className="px-6 py-4 font-medium">{r.patientName}</td>
+                            <td className="px-6 py-4">{r.officeAlly?.payer}</td>
+                            <td className="px-6 py-4 text-right font-bold text-rose-600">
+                              {currencyFormatter.format(parseCurrency(r.officeAlly?.paid || '0'))}
+                            </td>
+                            <td className="px-6 py-4 text-right text-black/40">
+                              {currencyFormatter.format(r.payerMode || 0)}
+                            </td>
+                            <td className="px-6 py-4 text-right font-black text-rose-700">
+                              -{currencyFormatter.format((r.payerMode || 0) - parseCurrency(r.officeAlly?.paid || '0'))}
+                            </td>
+                          </tr>
+                        ))}
+                        {results.records.filter(r => r.isBelowMode).length === 0 && (
+                          <tr><td colSpan={5} className="px-6 py-8 text-center text-black/30 italic">No underpaid claims found.</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {reportSubTab === '97750' && results && (
+              <div className="space-y-6">
+                <div className="bg-white rounded-3xl border border-black/5 shadow-sm overflow-hidden">
+                  <div className="px-6 py-4 border-b border-black/5 bg-[#F5F5F0]/50 flex justify-between items-center">
+                    <div>
+                      <h3 className="font-bold text-lg">CPT 97750 Unit Analysis</h3>
+                      <p className="text-sm text-black/40">Analysis of units billed for CPT 97750 (Physical Performance Test).</p>
+                    </div>
+                    <div className="flex gap-4">
+                      <div className="text-center">
+                        <p className="text-[10px] uppercase font-bold text-black/40">Total 97750 Claims</p>
+                        <p className="text-xl font-serif italic">{results.records.filter(r => r.officeAlly?.cpt === '97750').length}</p>
+                      </div>
+                      <div className="text-center">
+                        <p className="text-[10px] uppercase font-bold text-rose-400">Unit Mismatches</p>
+                        <p className="text-xl font-serif italic text-rose-600">{verificationRecords.unitMismatches.length}</p>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead className="bg-black/5 text-black/40 uppercase text-[10px] font-bold tracking-widest">
+                        <tr>
+                          <th className="px-6 py-4">Patient Name</th>
+                          <th className="px-6 py-4">Provider</th>
+                          <th className="px-6 py-4">DOS</th>
+                          <th className="px-6 py-4 text-center">Units</th>
+                          <th className="px-6 py-4">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-black/5">
+                        {results.records.filter(r => r.officeAlly?.cpt === '97750').map((r, i) => (
+                          <tr key={i} className="hover:bg-[#F5F5F0]/30 transition-colors">
+                            <td className="px-6 py-4 font-medium">{r.patientName}</td>
+                            <td className="px-6 py-4">{r.provider}</td>
+                            <td className="px-6 py-4">{r.officeAlly?.dos}</td>
+                            <td className="px-6 py-4 text-center">
+                              <span className={cn(
+                                "font-bold px-2 py-1 rounded",
+                                r.unitInfo?.isMismatch ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"
+                              )}>
+                                {r.unitInfo?.totalUnits}
+                              </span>
+                            </td>
+                            <td className="px-6 py-4">
+                              {r.unitInfo?.isMismatch ? (
+                                <span className="text-rose-500 text-xs italic flex items-center gap-1">
+                                  <AlertCircle size={12} /> {r.unitInfo.details}
+                                </span>
+                              ) : (
+                                <span className="text-emerald-600 text-xs flex items-center gap-1">
+                                  <CheckCircle2 size={12} /> Correct
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
             {reportSubTab === 'summary' && providerMonthlyMatrix && (
               <div className="bg-white rounded-3xl border border-black/5 shadow-sm overflow-hidden">
                 <div className="px-6 py-4 border-b border-black/5 bg-[#F5F5F0]/50">
@@ -1042,7 +1229,7 @@ export default function App() {
                         let totalCollected = 0;
                         return (
                           <tr key={provider} className="hover:bg-[#F5F5F0]/30 transition-colors">
-                            <td className="px-6 py-4 font-bold sticky left-0 bg-white z-10">{provider}</td>
+                            <td className="px-6 py-4 font-bold sticky left-0 bg-white z-10">{providerMonthlyMatrix.displayNames[provider]}</td>
                             {providerMonthlyMatrix.months.map(month => {
                               const stats = providerMonthlyMatrix.matrix[provider]?.[month] || { done: 0, billed: 0, collected: 0 };
                               totalDone += stats.done;
